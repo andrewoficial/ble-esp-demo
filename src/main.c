@@ -1,31 +1,44 @@
 #include "app.h"
 
 #include "esp_log.h"
+#include "esp_app_desc.h"
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
 #include "driver/uart.h"
-#include "driver/temp_sensor.h"
+#include "soc/soc_caps.h"
+#if SOC_TEMP_SENSOR_SUPPORTED
+#include "driver/temperature_sensor.h"
+#endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include <string.h>
 #include <stdio.h>
 
 static const char *TAG = "main";
+#if SOC_TEMP_SENSOR_SUPPORTED
+static temperature_sensor_handle_t tsens;
+#endif
 
 // ─── Температура ───
 float app_get_chip_temp_c(void)
 {
-#if CONFIG_IDF_TARGET_ESP32
-    // На классическом ESP32 используем legacy-датчик.
-    // temperature_sens_read() возвращает °F — переводим в °C.
-    float tf = temperature_sens_read();
-    return (tf - 32.0f) * 5.0f / 9.0f;
+#if SOC_TEMP_SENSOR_SUPPORTED
+    float temp_c = 0.0f;
+    if (tsens) {
+        if (temperature_sensor_get_celsius(tsens, &temp_c) != ESP_OK) {
+            ESP_LOGE(TAG, "Failed to read chip temperature");
+        }
+    }
+    return temp_c;
 #else
-    // Для C3/S3 и др. — новый API (при необходимости).
-    // Здесь оставлено для совместимости.
     return 0.0f;
 #endif
+}
+
+const char *app_get_firmware_version(void)
+{
+    return esp_app_get_description()->version;
 }
 
 // ─── IP ───
@@ -114,6 +127,33 @@ static void wifi_init_sta(void)
     esp_wifi_start();
 }
 
+esp_err_t app_wifi_apply_config(void)
+{
+    wifi_config_t wc = {0};
+    size_t ssid_len = strlen(g_config.wifi_ssid);
+    size_t pass_len = strlen(g_config.wifi_pass);
+
+    if (ssid_len == 0 || ssid_len > sizeof(wc.sta.ssid) ||
+        pass_len >= sizeof(wc.sta.password)) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    memcpy(wc.sta.ssid, g_config.wifi_ssid, ssid_len);
+    memcpy(wc.sta.password, g_config.wifi_pass, pass_len);
+
+    esp_err_t err = esp_wifi_disconnect();
+    if (err != ESP_OK && err != ESP_ERR_WIFI_NOT_CONNECT) {
+        return err;
+    }
+
+    err = esp_wifi_set_config(WIFI_IF_STA, &wc);
+    if (err != ESP_OK) {
+        return err;
+    }
+
+    return esp_wifi_connect();
+}
+
 // ─── Точка входа ───
 void app_main(void)
 {
@@ -129,11 +169,14 @@ void app_main(void)
     storage_init();
     storage_load();
 
-    // Temperature sensor (legacy API для ESP32)
-    temperature_sensor_handle_t tsens = NULL;
-    temperature_sensor_config_t tsens_cfg = TEMPERATURE_SENSOR_CONFIG_DEFAULT(-10, 80);
-    temperature_sensor_install(&tsens_cfg, &tsens);
-    temperature_sensor_enable(tsens);
+#if SOC_TEMP_SENSOR_SUPPORTED
+    temperature_sensor_config_t tsens_cfg = {
+        .range_min = -10,
+        .range_max = 80,
+    };
+    ESP_ERROR_CHECK(temperature_sensor_install(&tsens_cfg, &tsens));
+    ESP_ERROR_CHECK(temperature_sensor_enable(tsens));
+#endif
 
     esp_netif_init();
     esp_event_loop_create_default();
