@@ -34,16 +34,23 @@ static const ble_uuid128_t nus_tx_uuid =
 
 static uint16_t tx_val_handle;
 
-static void build_manufacturer_data(uint8_t mfg[10])
+static void build_manufacturer_data(uint8_t mfg[8])
 {
     char ip[16];
     app_get_ip_string(ip, sizeof(ip));
-    float temp = app_get_chip_temp_c();
+    int32_t pid_mv = 0;
+    app_get_pid_millivolts(&pid_mv);
+    if (pid_mv < 0) {
+        pid_mv = 0;
+    } else if (pid_mv > 3500) {
+        pid_mv = 3500;
+    }
 
     mfg[0] = 0xFF;
     mfg[1] = 0xFF;
     sscanf(ip, "%hhu.%hhu.%hhu.%hhu", &mfg[2], &mfg[3], &mfg[4], &mfg[5]);
-    memcpy(&mfg[6], &temp, sizeof(temp));
+    mfg[6] = (uint8_t)(pid_mv & 0xFF);
+    mfg[7] = (uint8_t)((uint32_t)pid_mv >> 8);
 }
 
 void ble_nus_get_advertising_description(char *buf, size_t len)
@@ -52,7 +59,7 @@ void ble_nus_get_advertising_description(char *buf, size_t len)
         return;
     }
 
-    uint8_t mfg[10];
+    uint8_t mfg[8];
     build_manufacturer_data(mfg);
 
     int written = snprintf(buf, len,
@@ -73,6 +80,10 @@ void ble_nus_get_advertising_description(char *buf, size_t len)
             return;
         }
         pos += (size_t)written;
+    }
+    if (pos < len) {
+        int32_t pid_mv = (int32_t)mfg[6] | ((int32_t)mfg[7] << 8);
+        snprintf(buf + pos, len - pos, " pid_mv=%ld", (long)pid_mv);
     }
 }
 
@@ -151,8 +162,8 @@ static esp_err_t update_advertising(void)
 {
     if (conn_handle != BLE_HS_CONN_HANDLE_NONE) return ESP_OK;
 
-    // Manufacturer data: company ID 0xFFFF + 4 bytes IP + 4 bytes float temp
-    uint8_t mfg[10];
+    // Manufacturer data: company ID 0xFFFF + IPv4 + unsigned 16-bit PID millivolts.
+    uint8_t mfg[8];
     build_manufacturer_data(mfg);
 
     struct ble_hs_adv_fields fields = {0};

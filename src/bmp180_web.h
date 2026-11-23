@@ -1,0 +1,16 @@
+static const char bmp180_dashboard_script[] =
+"<script>"
+"function initBmxUi(){"
+"document.querySelector('.stats').insertAdjacentHTML('beforeend',`"
+"<article class='stat'><div class='stat-label'>Температура BMP180</div><div class='stat-value' id='bmxTemp'>— °C</div><div class='stat-note'>GPIO21/22 · I²C</div></article>"
+"<article class='stat'><div class='stat-label'>Давление BMP180</div><div class='stat-value' id='bmxPress'>— hPa</div><div class='stat-note'>Измерение датчика</div></article>"
+"<article class='stat'><div class='stat-label'>Влажность</div><div class='stat-value' id='bmxHumidity'>—</div><div class='stat-note'>BMP180 не измеряет влажность</div></article>`);"
+"document.querySelector('.columns').insertAdjacentHTML('beforeend',`"
+"<article class='card setting pid-settings' id='bmx'><div class='card-head'><div><h3>BMP180</h3><p class='desc'>Температура и атмосферное давление · адрес I²C 0x77</p></div><span class='tag'>BMP180</span></div>"
+"<div class='pid-fields' style='grid-template-columns:repeat(2,minmax(0,1fr))'><label class='field'>Множитель температуры<input class='input' id='bmxTempAmp' type='number' min='0' max='999999' step='any'></label><div class='copy'><strong>Влажность</strong><small>BMP180 не поддерживает влажность; команды HYDM недоступны.</small></div></div>"
+"<div class='pid-actions'><small class='muted' id='bmxConfigStatus'>Формула температуры: значение BMP180 × множитель</small><button class='btn' type='button' onclick='saveBmx()'>Сохранить множитель</button></div></article>`);"
+"document.querySelector('.nav').insertAdjacentHTML('beforeend',`<a href='#bmx'><b>℃</b>BMP180</a>`)}"
+"async function saveBmx(){const multiplier=Number($('bmxTempAmp').value);if(!Number.isFinite(multiplier)||multiplier<0||multiplier>999999){toast('Множитель должен быть от 0 до 999999');return}try{const result=await command('SETBMXTERMAMP'+multiplier);if(!result.startsWith('OK'))throw Error(result);$('bmxConfigStatus').textContent='Множитель сохранён в устройстве';toast('Настройка BMP180 сохранена');refreshBmx()}catch(e){$('bmxConfigStatus').textContent=String(e.message||e);toast('Не удалось сохранить множитель BMP180')}}"
+"async function refreshBmx(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error();const d=await r.json();$('bmxTemp').textContent=d.bmx_ready?Number(d.bmx_temp_c).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})+' °C':'— °C';$('bmxPress').textContent=d.bmx_ready?(d.bmx_pressure_pa/100).toLocaleString('ru-RU',{minimumFractionDigits:2,maximumFractionDigits:2})+' hPa':'— hPa';$('bmxHumidity').textContent='Н/Д';if(!$('bmxTempAmp').dataset.loaded){$('bmxTempAmp').value=d.bmx_temp_multiplier;$('bmxTempAmp').dataset.loaded='1'}}catch(e){}}"
+"initBmxUi();refreshBmx();setInterval(refreshBmx,3000);"
+"</script>";

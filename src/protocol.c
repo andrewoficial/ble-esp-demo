@@ -1,6 +1,8 @@
 #include "app.h"
 
 #include "esp_log.h"
+#include <errno.h>
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +20,16 @@
 //   GETIP               → получить IP-адрес Wi-Fi
 //   GETADVDESC          → получить данные advertising и scan response
 //   GETADVSVC           → получить описание GATT-сервиса и характеристик
+//   GETPID              → получить измеренное значение PID в мВ
+//   SETOFSETPID<n>      → задать смещение PID в мВ
+//   SETAMPPID<n>        → задать коэффициент PID
+//   SETAVGPIONTSPID<n>  → задать количество точек усреднения
+//   GETBMXTERM          → температура BMP180 в °C
+//   GETBMXPRESS         → давление BMP180 в Pa
+//   GETBMXTERMAMP       → получить множитель температуры BMP180
+//   SETBMXTERMAMP<n>    → задать множитель температуры BMP180
+//   GETBMXHYDM          → влажность (BMP180 не поддерживает)
+//   SETBMXHYDMAMP<n>    → настройка влажности (BMP180 не поддерживает)
 //   SETNAME<name>       → задать и сохранить имя BLE (до 17 байт)
 //   LOGOFF              → отключить runtime-логи ESP-IDF
 //   LOGON               → включить runtime-логи ESP-IDF
@@ -28,6 +40,52 @@
 //   set_int <i>         → сохранить int
 //   get_int             → прочитать int
 //
+static const char *setting_value(const char *command, size_t prefix_len)
+{
+    const char *value = command + prefix_len;
+    while (*value == ' ' || *value == '\t' || *value == '=') {
+        value++;
+    }
+    return value;
+}
+
+static bool parse_integer_setting(const char *text, int32_t *value)
+{
+    errno = 0;
+    char *end = NULL;
+    long parsed = strtol(text, &end, 10);
+    if (text == end || errno == ERANGE || parsed < 0 || parsed > 999999) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    *value = (int32_t)parsed;
+    return true;
+}
+
+static bool parse_multiplier_setting(const char *text, float *value)
+{
+    errno = 0;
+    char *end = NULL;
+    float parsed = strtof(text, &end);
+    if (text == end || errno == ERANGE || !isfinite(parsed) ||
+        parsed < 0.0f || parsed > 999999.0f) {
+        return false;
+    }
+    while (*end == ' ' || *end == '\t') {
+        end++;
+    }
+    if (*end != '\0') {
+        return false;
+    }
+    *value = parsed;
+    return true;
+}
+
 void protocol_execute(const char *cmd, char *response, size_t max_len)
 {
     if (!cmd || !response || max_len == 0) return;
@@ -66,6 +124,145 @@ void protocol_execute(const char *cmd, char *response, size_t max_len)
 
     if (strcmp(tmp, "GETADVSVC") == 0) {
         ble_nus_get_service_description(response, max_len);
+        return;
+    }
+
+    if (strcmp(tmp, "GETPID") == 0) {
+        int32_t millivolts;
+        if (app_get_pid_millivolts(&millivolts)) {
+            snprintf(response, max_len, "PID: [%ld] mV", (long)millivolts);
+        } else {
+            snprintf(response, max_len, "PID: [not ready]");
+        }
+        return;
+    }
+
+    if (strcmp(tmp, "GETBMXTERM") == 0) {
+        float temperature_c;
+        if (app_get_bmx_reading(&temperature_c, NULL)) {
+            snprintf(response, max_len, "BMXTERM: [%.2f] C", (double)temperature_c);
+        } else {
+            snprintf(response, max_len, "BMXTERM: [not ready]");
+        }
+        return;
+    }
+
+    if (strcmp(tmp, "GETBMXPRESS") == 0) {
+        int32_t pressure_pa;
+        if (app_get_bmx_reading(NULL, &pressure_pa)) {
+            snprintf(response, max_len, "BMXPRESS: [%ld] Pa", (long)pressure_pa);
+        } else {
+            snprintf(response, max_len, "BMXPRESS: [not ready]");
+        }
+        return;
+    }
+
+    if (strcmp(tmp, "GETBMXHYDM") == 0 || strcmp(tmp, "GETBMXHYDMAMP") == 0) {
+        snprintf(response, max_len, "ERR humidity is not supported by BMP180");
+        return;
+    }
+
+    if (strcmp(tmp, "GETBMXTERMAMP") == 0) {
+        snprintf(response, max_len, "BMXTERMAMP: [%.6g]",
+                 (double)app_get_bmx_temp_multiplier());
+        return;
+    }
+
+    if (strncmp(tmp, "SETBMXHYDMAMP", 13) == 0) {
+        snprintf(response, max_len, "ERR humidity is not supported by BMP180");
+        return;
+    }
+
+    if (strncmp(tmp, "SETBMXTERMAMP", 13) == 0) {
+        float multiplier;
+        if (!parse_multiplier_setting(setting_value(tmp, 13), &multiplier)) {
+            snprintf(response, max_len, "ERR multiplier range 0..999999");
+            return;
+        }
+        esp_err_t err = app_bmx_update_temp_multiplier(multiplier);
+        if (err != ESP_OK) {
+            snprintf(response, max_len, "ERR failed to save BMP180 temperature multiplier: %s",
+                     esp_err_to_name(err));
+            return;
+        }
+        snprintf(response, max_len, "OK bmx_temp_amp=%.6g", (double)multiplier);
+        return;
+    }
+
+    if (strcmp(tmp, "GETOFFSETPID") == 0) {
+        int32_t offset_mv;
+        app_get_pid_config(&offset_mv, NULL, NULL);
+        snprintf(response, max_len, "OFFSETPID: [%ld] mV", (long)offset_mv);
+        return;
+    }
+
+    if (strcmp(tmp, "GETAMPPID") == 0) {
+        float multiplier;
+        app_get_pid_config(NULL, &multiplier, NULL);
+        snprintf(response, max_len, "AMPPID: [%.6g]", (double)multiplier);
+        return;
+    }
+
+    if (strcmp(tmp, "GETAVGPIONTSPID") == 0) {
+        uint32_t avg_points;
+        app_get_pid_config(NULL, NULL, &avg_points);
+        snprintf(response, max_len, "AVGPIONTSPID: [%lu]", (unsigned long)avg_points);
+        return;
+    }
+
+    if (strncmp(tmp, "SETOFSETPID", 11) == 0) {
+        int32_t offset_mv;
+        float multiplier;
+        uint32_t avg_points;
+        if (!parse_integer_setting(setting_value(tmp, 11), &offset_mv)) {
+            snprintf(response, max_len, "ERR offset range 0..999999 mV");
+            return;
+        }
+        app_get_pid_config(NULL, &multiplier, &avg_points);
+        esp_err_t err = app_pid_update_config(offset_mv, multiplier, avg_points);
+        if (err != ESP_OK) {
+            snprintf(response, max_len, "ERR failed to save PID offset: %s", esp_err_to_name(err));
+            return;
+        }
+        snprintf(response, max_len, "OK offset_pid_mv=%ld", (long)offset_mv);
+        return;
+    }
+
+    if (strncmp(tmp, "SETAMPPID", 9) == 0) {
+        int32_t offset_mv;
+        float multiplier;
+        uint32_t avg_points;
+        if (!parse_multiplier_setting(setting_value(tmp, 9), &multiplier)) {
+            snprintf(response, max_len, "ERR multiplier range 0..999999");
+            return;
+        }
+        app_get_pid_config(&offset_mv, NULL, &avg_points);
+        esp_err_t err = app_pid_update_config(offset_mv, multiplier, avg_points);
+        if (err != ESP_OK) {
+            snprintf(response, max_len, "ERR failed to save PID multiplier: %s", esp_err_to_name(err));
+            return;
+        }
+        snprintf(response, max_len, "OK amp_pid=%.6g", (double)multiplier);
+        return;
+    }
+
+    if (strncmp(tmp, "SETAVGPIONTSPID", 15) == 0) {
+        int32_t parsed_points;
+        int32_t offset_mv;
+        float multiplier;
+        uint32_t avg_points;
+        if (!parse_integer_setting(setting_value(tmp, 15), &parsed_points) || parsed_points == 0) {
+            snprintf(response, max_len, "ERR averaging points range 1..999999");
+            return;
+        }
+        app_get_pid_config(&offset_mv, &multiplier, &avg_points);
+        avg_points = (uint32_t)parsed_points;
+        esp_err_t err = app_pid_update_config(offset_mv, multiplier, avg_points);
+        if (err != ESP_OK) {
+            snprintf(response, max_len, "ERR failed to save PID averaging points: %s", esp_err_to_name(err));
+            return;
+        }
+        snprintf(response, max_len, "OK avg_points_pid=%lu", (unsigned long)avg_points);
         return;
     }
 

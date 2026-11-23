@@ -7,8 +7,11 @@
 #include "esp_ota_ops.h"
 #include "esp_partition.h"
 #include "esp_timer.h"
+#include "esp_wifi.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "bmp180_web.h"
+#include "web_page.h"
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
@@ -40,89 +43,67 @@ static void ota_log(const char *level, const char *format, ...)
     fflush(stdout);
 }
 
-// ─── Минималистичная HTML-страница (клиент) ───
-static const char *html_page =
-"<!DOCTYPE html><html><head><meta charset='utf-8'><title>ESP32 Mock</title>"
-"<style>body{font-family:monospace;margin:2em;}button{margin:2px;}</style></head><body>"
-"<h2>ESP32 NUS Mock</h2>"
-"<p>Temp: <b id='temp'>--</b> °C</p>"
-"<p>IP: <b id='ip'>--</b></p>"
-"<p>FW: <b id='fw'>--</b></p>"
-"<p>BLE clients: <b id='ble'>--</b></p>"
-"<hr>"
-"<button onclick=\"cmd('temp')\">Temp</button>"
-"<button onclick=\"cmd('ver')\">Version</button>"
-"<button onclick=\"cmd('get_ble_clients')\">BLE clients</button>"
-"<hr><h3>Firmware update</h3>"
-"<input type='file' id='otaFile' accept='.bin,application/octet-stream'>"
-"<input type='password' id='otaPassword' placeholder='OTA password'>"
-"<button onclick='uploadFirmware()'>Upload firmware</button>"
-"<p>Set the password in Serial Monitor first: SETOTAPASS &lt;password&gt; (8-63 characters).</p>"
-"<p>Device progress reflects bytes written to flash; server reads at most 5 KB per block.</p>"
-"<progress id='otaProgress' value='0' max='100' style='display:none'></progress>"
-"<p id='otaStatus'></p>"
-"<pre id='out'></pre>"
-"<script>"
-"async function cmd(c){"
-"  let r=await fetch('/api/cmd?c='+encodeURIComponent(c));"
-"  document.getElementById('out').textContent=await r.text();"
-"}"
-"async function refresh(){"
-"  let r=await fetch('/api/status'); let j=await r.json();"
-"  document.getElementById('temp').textContent=j.temp.toFixed(1);"
-"  document.getElementById('ip').textContent=j.ip;"
-"  document.getElementById('fw').textContent=j.fw;"
-"  document.getElementById('ble').textContent=j.ble_clients;"
-"}"
-"function uploadFirmware(){"
-"  const file=document.getElementById('otaFile').files[0];"
-"  const password=document.getElementById('otaPassword').value;"
-"  const status=document.getElementById('otaStatus');"
-"  const progress=document.getElementById('otaProgress');"
-"  if(!file){status.textContent='Select an application .bin file first.';return;}"
-"  if(!password){status.textContent='Enter the OTA password.';return;}"
-"  if(!confirm('Install '+file.name+' and restart the device?'))return;"
-"  const request=new XMLHttpRequest();"
-"  request.open('POST','/api/ota');"
-"  request.setRequestHeader('Content-Type','application/octet-stream');"
-"  request.setRequestHeader('X-OTA-Password',password);"
-"  request.upload.onload=()=>{status.textContent='File sent; waiting for device verification...';};"
-"  request.onload=()=>{status.textContent=request.responseText;};"
-"  request.onerror=()=>{status.textContent='Upload failed: network error.';};"
-"  status.textContent='Starting upload...';progress.style.display='';progress.value=0;"
-"  request.send(file);"
-"}"
-"async function refreshOtaStatus(){"
-"  try{"
-"    const response=await fetch('/api/ota/status');"
-"    const ota=await response.json();"
-"    const progress=document.getElementById('otaProgress');"
-"    const status=document.getElementById('otaStatus');"
-"    if(ota.total>0){progress.style.display='';progress.value=ota.written*100/ota.total;}"
-"    if(ota.active){status.textContent=ota.stage+': '+Math.floor(ota.written*100/ota.total)+'% written to flash';}"
-"    else if(ota.stage==='Failed'){status.textContent='OTA failed: '+ota.message;}"
-"  }catch(error){"
-"    document.getElementById('otaStatus').textContent='OTA status temporarily unavailable.';"
-"  }"
-"}"
-"setInterval(refresh,3000); refresh();"
-"setInterval(refreshOtaStatus,1000); refreshOtaStatus();"
-"</script></body></html>";
 
 static esp_err_t root_handler(httpd_req_t *req)
 {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
+    const char *body_end = strstr(dashboard_html, "</body>");
+    if (body_end == NULL) {
+        return httpd_resp_send(req, dashboard_html, HTTPD_RESP_USE_STRLEN);
+    }
+
+    esp_err_t err = httpd_resp_send_chunk(req, dashboard_html,
+                                          (ssize_t)(body_end - dashboard_html));
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = httpd_resp_send_chunk(req, bmp180_dashboard_script,
+                                HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) {
+        return err;
+    }
+    err = httpd_resp_send_chunk(req, body_end, HTTPD_RESP_USE_STRLEN);
+    if (err != ESP_OK) {
+        return err;
+    }
+    return httpd_resp_send_chunk(req, NULL, 0);
 }
 
 static esp_err_t status_handler(httpd_req_t *req)
 {
-    char ip[16], json[256];
+    char ip[16], json[640];
     app_get_ip_string(ip, sizeof(ip));
+    wifi_ap_record_t ap_info = {0};
+    bool wifi_connected = esp_wifi_sta_get_ap_info(&ap_info) == ESP_OK;
+    int32_t pid_mv = 0;
+    bool pid_ready = app_get_pid_millivolts(&pid_mv);
+    int32_t pid_offset_mv;
+    float pid_multiplier;
+    uint32_t pid_avg_points;
+    app_get_pid_config(&pid_offset_mv, &pid_multiplier, &pid_avg_points);
+    float bmx_temperature_c = 0.0f;
+    int32_t bmx_pressure_pa = 0;
+    bool bmx_ready = app_get_bmx_reading(&bmx_temperature_c, &bmx_pressure_pa);
+    float bmx_temp_multiplier = app_get_bmx_temp_multiplier();
     snprintf(json, sizeof(json),
-             "{\"temp\":%.2f,\"ip\":\"%s\",\"fw\":\"%s\",\"ble_clients\":%d}",
-             app_get_chip_temp_c(), ip, app_get_firmware_version(), app_get_ble_client_count());
+             "{\"temp\":%.2f,\"ip\":\"%s\",\"fw\":\"%s\",\"ble_clients\":%d,"
+             "\"wifi_connected\":%s,\"wifi_rssi\":%d,\"heap_free\":%u,"
+             "\"heap_min\":%u,\"heap_largest\":%u,\"html_bytes\":%u,"
+             "\"hw\":\"%s\",\"pid_ready\":%s,\"pid_mv\":%ld,\"pid_samples\":%lu,"
+             "\"pid_offset_mv\":%ld,\"pid_multiplier\":%.6g,\"pid_avg_points\":%lu,"
+             "\"bmx_ready\":%s,\"bmx_temp_c\":%.2f,\"bmx_pressure_pa\":%ld,"
+             "\"bmx_temp_multiplier\":%.6g}",
+             app_get_chip_temp_c(), ip, app_get_firmware_version(), app_get_ble_client_count(),
+             wifi_connected ? "true" : "false", wifi_connected ? ap_info.rssi : 0,
+             (unsigned)esp_get_free_heap_size(), (unsigned)esp_get_minimum_free_heap_size(),
+             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT),
+             (unsigned)(strlen(dashboard_html) + strlen(bmp180_dashboard_script)),
+             APP_HARDWARE_VERSION,
+             pid_ready ? "true" : "false", (long)pid_mv,
+             (unsigned long)app_get_pid_sample_count(), (long)pid_offset_mv,
+             (double)pid_multiplier, (unsigned long)pid_avg_points,
+             bmx_ready ? "true" : "false", (double)bmx_temperature_c,
+             (long)bmx_pressure_pa, (double)bmx_temp_multiplier);
     httpd_resp_set_type(req, "application/json");
     httpd_resp_send(req, json, HTTPD_RESP_USE_STRLEN);
     return ESP_OK;

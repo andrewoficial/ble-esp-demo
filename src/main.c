@@ -5,6 +5,9 @@
 #include "esp_netif.h"
 #include "esp_wifi.h"
 #include "nvs_flash.h"
+#include "esp_adc/adc_cali.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_adc/adc_oneshot.h"
 #include "driver/uart.h"
 #include "soc/soc_caps.h"
 #if SOC_TEMP_SENSOR_SUPPORTED
@@ -12,6 +15,7 @@
 #endif
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <math.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -19,6 +23,232 @@ static const char *TAG = "main";
 #if SOC_TEMP_SENSOR_SUPPORTED
 static temperature_sensor_handle_t tsens;
 #endif
+static adc_oneshot_unit_handle_t pid_adc_unit;
+static adc_cali_handle_t pid_adc_calibration;
+static adc_channel_t pid_adc_channel;
+static portMUX_TYPE pid_lock = portMUX_INITIALIZER_UNLOCKED;
+static bool pid_reading_ready;
+static int32_t pid_millivolts;
+static uint32_t pid_samples;
+
+static void pid_reset_reading_locked(void)
+{
+    pid_reading_ready = false;
+    pid_millivolts = 0;
+    pid_samples = 0;
+}
+
+static void pid_sensor_task(void *arg)
+{
+    uint64_t sample_sum_mv = 0;
+    uint32_t sample_count = 0;
+    int32_t previous_offset = -1;
+    float previous_multiplier = -1.0f;
+    uint32_t previous_points = 0;
+    esp_err_t previous_read_error = ESP_OK;
+
+    while (true) {
+        int32_t offset_mv;
+        float multiplier;
+        uint32_t avg_points;
+        portENTER_CRITICAL(&pid_lock);
+        offset_mv = g_config.pid_offset_mv;
+        multiplier = g_config.pid_multiplier;
+        avg_points = g_config.pid_avg_points;
+        portEXIT_CRITICAL(&pid_lock);
+
+        if (offset_mv != previous_offset || multiplier != previous_multiplier ||
+            avg_points != previous_points) {
+            sample_sum_mv = 0;
+            sample_count = 0;
+            previous_offset = offset_mv;
+            previous_multiplier = multiplier;
+            previous_points = avg_points;
+            portENTER_CRITICAL(&pid_lock);
+            pid_reset_reading_locked();
+            portEXIT_CRITICAL(&pid_lock);
+        }
+
+        int raw = 0;
+        int input_mv = 0;
+        esp_err_t err = adc_oneshot_read(pid_adc_unit, pid_adc_channel, &raw);
+        if (err == ESP_OK && pid_adc_calibration != NULL) {
+            err = adc_cali_raw_to_voltage(pid_adc_calibration, raw, &input_mv);
+        } else if (err == ESP_OK) {
+            input_mv = (raw * 3300) / 4095;
+        }
+
+        if (err != ESP_OK) {
+            if (err != previous_read_error) {
+                ESP_LOGE(TAG, "PID ADC read failed: %s", esp_err_to_name(err));
+                previous_read_error = err;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+            continue;
+        }
+        previous_read_error = ESP_OK;
+
+        sample_sum_mv += (uint32_t)input_mv;
+        sample_count++;
+
+        if (sample_count >= avg_points) {
+            double calibrated_mv = ((double)sample_sum_mv / sample_count + offset_mv) * multiplier;
+            if (calibrated_mv < 0.0) {
+                calibrated_mv = 0.0;
+            } else if (calibrated_mv > 999999.0) {
+                calibrated_mv = 999999.0;
+            }
+
+            portENTER_CRITICAL(&pid_lock);
+            if (g_config.pid_offset_mv == offset_mv &&
+                g_config.pid_multiplier == multiplier &&
+                g_config.pid_avg_points == avg_points) {
+                pid_millivolts = (int32_t)lround(calibrated_mv);
+                pid_reading_ready = true;
+                pid_samples = sample_count;
+            } else {
+                pid_reset_reading_locked();
+            }
+            portEXIT_CRITICAL(&pid_lock);
+            sample_sum_mv = 0;
+            sample_count = 0;
+        } else {
+            portENTER_CRITICAL(&pid_lock);
+            pid_samples = sample_count;
+            portEXIT_CRITICAL(&pid_lock);
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+}
+
+esp_err_t app_pid_sensor_init(void)
+{
+    adc_unit_t unit;
+    esp_err_t err = adc_oneshot_io_to_channel(32, &unit, &pid_adc_channel);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "GPIO32 is not available as an ADC input: %s", esp_err_to_name(err));
+        return err;
+    }
+    if (unit != ADC_UNIT_1) {
+        ESP_LOGE(TAG, "PID sensor must use ADC1 to operate while Wi-Fi is active");
+        return ESP_ERR_NOT_SUPPORTED;
+    }
+
+    adc_oneshot_unit_init_cfg_t unit_config = {
+        .unit_id = unit,
+        .ulp_mode = ADC_ULP_MODE_DISABLE,
+    };
+    err = adc_oneshot_new_unit(&unit_config, &pid_adc_unit);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize PID ADC: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    const adc_oneshot_chan_cfg_t channel_config = {
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+    };
+    err = adc_oneshot_config_channel(pid_adc_unit, pid_adc_channel, &channel_config);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure PID ADC: %s", esp_err_to_name(err));
+        return err;
+    }
+
+#if ADC_CALI_SCHEME_LINE_FITTING_SUPPORTED
+    const adc_cali_line_fitting_config_t calibration_config = {
+        .unit_id = unit,
+        .atten = ADC_ATTEN_DB_12,
+        .bitwidth = ADC_BITWIDTH_12,
+        .default_vref = 1100,
+    };
+    err = adc_cali_create_scheme_line_fitting(&calibration_config, &pid_adc_calibration);
+    if (err != ESP_OK) {
+        ESP_LOGW(TAG, "PID ADC calibration unavailable; using approximate voltage: %s",
+                 esp_err_to_name(err));
+        pid_adc_calibration = NULL;
+    }
+#else
+    ESP_LOGW(TAG, "PID ADC calibration scheme unavailable; using approximate voltage");
+#endif
+
+    if (xTaskCreate(pid_sensor_task, "pid_sensor", 3072, NULL, 5, NULL) != pdPASS) {
+        ESP_LOGE(TAG, "Failed to create PID sensor task");
+        return ESP_ERR_NO_MEM;
+    }
+
+    ESP_LOGI(TAG, "PID sensor initialized on GPIO32 / ADC1");
+    return ESP_OK;
+}
+
+bool app_get_pid_millivolts(int32_t *millivolts)
+{
+    if (millivolts == NULL) {
+        return false;
+    }
+
+    portENTER_CRITICAL(&pid_lock);
+    bool ready = pid_reading_ready;
+    *millivolts = pid_millivolts;
+    portEXIT_CRITICAL(&pid_lock);
+    return ready;
+}
+
+uint32_t app_get_pid_sample_count(void)
+{
+    portENTER_CRITICAL(&pid_lock);
+    uint32_t samples = pid_samples;
+    portEXIT_CRITICAL(&pid_lock);
+    return samples;
+}
+
+void app_get_pid_config(int32_t *offset_mv, float *multiplier, uint32_t *avg_points)
+{
+    portENTER_CRITICAL(&pid_lock);
+    if (offset_mv != NULL) {
+        *offset_mv = g_config.pid_offset_mv;
+    }
+    if (multiplier != NULL) {
+        *multiplier = g_config.pid_multiplier;
+    }
+    if (avg_points != NULL) {
+        *avg_points = g_config.pid_avg_points;
+    }
+    portEXIT_CRITICAL(&pid_lock);
+}
+
+esp_err_t app_pid_update_config(int32_t offset_mv, float multiplier, uint32_t avg_points)
+{
+    if (offset_mv < 0 || offset_mv > 999999 || !isfinite(multiplier) ||
+        multiplier < 0.0f || multiplier > 999999.0f ||
+        avg_points < 1 || avg_points > 999999) {
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    int32_t old_offset;
+    float old_multiplier;
+    uint32_t old_avg_points;
+    portENTER_CRITICAL(&pid_lock);
+    old_offset = g_config.pid_offset_mv;
+    old_multiplier = g_config.pid_multiplier;
+    old_avg_points = g_config.pid_avg_points;
+    g_config.pid_offset_mv = offset_mv;
+    g_config.pid_multiplier = multiplier;
+    g_config.pid_avg_points = avg_points;
+    pid_reset_reading_locked();
+    portEXIT_CRITICAL(&pid_lock);
+
+    esp_err_t err = storage_save();
+    if (err != ESP_OK) {
+        portENTER_CRITICAL(&pid_lock);
+        g_config.pid_offset_mv = old_offset;
+        g_config.pid_multiplier = old_multiplier;
+        g_config.pid_avg_points = old_avg_points;
+        pid_reset_reading_locked();
+        portEXIT_CRITICAL(&pid_lock);
+    }
+    return err;
+}
 
 // ─── Температура ───
 float app_get_chip_temp_c(void)
@@ -182,6 +412,16 @@ void app_main(void)
     esp_event_loop_create_default();
 
     wifi_init_sta();
+
+    err = app_bmx_sensor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "BMP180 sensor unavailable: %s", esp_err_to_name(err));
+    }
+
+    err = app_pid_sensor_init();
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "PID sensor unavailable: %s", esp_err_to_name(err));
+    }
 
     ble_nus_init();          // NimBLE + NUS + реклама
     web_server_start();      // HTTP-клиентская страничка

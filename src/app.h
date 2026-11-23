@@ -7,8 +7,9 @@
 
 #define APP_BLE_NAME_MAX_LEN 17
 #define APP_OTA_PASSWORD_MAX_LEN 63
+#define APP_HARDWARE_VERSION "0.1.1"
 
-// ─── Конфигурация, которая сохраняется в NVS в виде JSON ───
+// ─── Конфигурация, которая сохраняется в NVS ───
 typedef struct {
     char    wifi_ssid[64];
     char    wifi_pass[64];
@@ -17,6 +18,10 @@ typedef struct {
     uint16_t ble_mtu;          // предпочитаемый MTU для NimBLE
     float   float_value;       // произвольный float
     int32_t int_value;         // произвольный int
+    int32_t pid_offset_mv;
+    float   pid_multiplier;
+    uint32_t pid_avg_points;
+    float bmx_temp_multiplier;
 } app_config_t;
 
 extern app_config_t g_config;
@@ -38,6 +43,19 @@ const char *app_get_firmware_version(void);
 void  app_get_ip_string(char *buf, size_t len);
 esp_err_t app_wifi_apply_config(void);
 int   app_get_ble_client_count(void);
+
+// PID analog sensor
+esp_err_t app_pid_sensor_init(void);
+bool app_get_pid_millivolts(int32_t *millivolts);
+uint32_t app_get_pid_sample_count(void);
+void app_get_pid_config(int32_t *offset_mv, float *multiplier, uint32_t *avg_points);
+esp_err_t app_pid_update_config(int32_t offset_mv, float multiplier, uint32_t avg_points);
+
+// BMP180 sensor
+esp_err_t app_bmx_sensor_init(void);
+bool app_get_bmx_reading(float *temperature_c, int32_t *pressure_pa);
+float app_get_bmx_temp_multiplier(void);
+esp_err_t app_bmx_update_temp_multiplier(float multiplier);
 
 // ble_nus.c
 esp_err_t ble_nus_init(void);

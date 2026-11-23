@@ -17,9 +17,62 @@ scan-response fields, including the raw manufacturer bytes. `GETADVSVC` reports
 the NUS GATT service and its RX/TX characteristic UUIDs and properties. These
 commands are available over Serial and BLE NUS. In `GETADVDESC`, the first two
 manufacturer bytes are company ID `0xFFFF`, followed by four IPv4 bytes and a
-four-byte little-endian float temperature. The classic ESP32 target in ESP-IDF
-6.1 does not expose the temperature sensor driver, so that temperature is
-currently reported as zero.
+two-byte little-endian unsigned PID reading in millivolts (saturated at
+3500 mV). The web dashboard shows the firmware version and hardware revision
+`HW 0.1.1`.
+
+The PID sensor uses GPIO32 (ADC1), which remains available while Wi-Fi is
+active. Its measured voltage is averaged over 60 samples by default, then
+calculated as `(ADC_mV + offset_mV) * multiplier`. Defaults are offset `0` and
+multiplier `1`. Configure and inspect it over Serial, BLE NUS, or the web
+command endpoint:
+
+| Command | Description |
+| --- | --- |
+| `GETPID` | Read the current calibrated value in mV |
+| `SETOFSETPID<n>` / `GETOFFSETPID` | Set/read offset in mV |
+| `SETAMPPID<n>` / `GETAMPPID` | Set/read multiplier |
+| `SETAVGPIONTSPID<n>` / `GETAVGPIONTSPID` | Set/read averaging sample count |
+
+Offset and multiplier accept values from `0` to `999999`; averaging accepts
+`1` to `999999`. Values are stored in NVS. Check the sensor output voltage
+before connecting it: do not exceed the ESP32 GPIO input limits. GPIO12 is an
+ADC2 pin on the classic ESP32 and cannot provide reliable conversions while
+Wi-Fi is active; use GPIO32/ADC1 as configured.
+
+The BMP180 (GY-68) is read over I2C at address `0x77` using SDA GPIO21 and SCL
+GPIO22. It reports temperature and pressure; BMP180 does not measure humidity.
+The temperature multiplier defaults to `1` and is stored in NVS:
+
+| Command | Description |
+| --- | --- |
+| `GETBMXTERM` | Read BMP180 temperature in °C |
+| `GETBMXPRESS` | Read BMP180 pressure in Pa |
+| `GETBMXTERMAMP` / `SETBMXTERMAMP<n>` | Read/set the temperature multiplier |
+| `GETBMXHYDM` / `SETBMXHYDMAMP<n>` | Return unsupported: BMP180 has no humidity sensor |
+
+The web dashboard shows the live temperature and pressure and allows changing
+the temperature multiplier. Pressure is shown in hPa on the dashboard.
+
+The display prototype supports the LCDWiki MSP3526 (ST7796, 320x480) using
+LVGL. It cycles through three demo pages automatically; touch input is not
+enabled yet. Proposed landscape wiring for the current ESP32-WROOM board:
+
+| MSP3526 pin | ESP32 GPIO |
+| --- | --- |
+| SCK | 18 |
+| SDI (MOSI) | 23 |
+| LCD_CS | 27 |
+| LCD_RS (D/C) | 16 |
+| LCD_RST | 17 |
+| VCC / GND | 3.3V / GND |
+| SDO (MISO), SD_CS | Not connected for the display demo |
+| CTP_SCL / CTP_SDA | Touch not enabled; these will share BMP180 I2C GPIO22/21 |
+| CTP_RST / CTP_INT | Touch not enabled |
+
+The backlight pin is not GPIO-driven in this prototype. Do not connect the
+backlight LED directly to an ESP32 GPIO. Pin orientation and backlight behavior
+should be checked against the actual module before wiring it.
 
 Web OTA accepts only the application image, not the combined image. The web
 progress indicator reports bytes confirmed written to flash, not just bytes
