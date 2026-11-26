@@ -428,9 +428,11 @@ void app_main(void)
 
     xTaskCreate(serial_task, "serial", 4096, NULL, 5, NULL);
 
-    // Периодическое обновление рекламы (температура меняется)
+    // Периодическое обновление рекламы: в manufacturer data передаются IP и
+    // текущее значение PID-сенсора (байты 6-7), поэтому перечитываем их раз
+    // в секунду; сенсор выдаёт новое усреднённое значение каждые ~0.6 с.
     while (1) {
-        vTaskDelay(pdMS_TO_TICKS(5000));
+        vTaskDelay(pdMS_TO_TICKS(1000));
         ble_nus_update_advertising();
     }
 }
