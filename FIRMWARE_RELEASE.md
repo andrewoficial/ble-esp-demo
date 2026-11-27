@@ -16,10 +16,13 @@ For BLE scanner testing, `GETADVDESC` reports the configured advertising and
 scan-response fields, including the raw manufacturer bytes. `GETADVSVC` reports
 the NUS GATT service and its RX/TX characteristic UUIDs and properties. These
 commands are available over Serial and BLE NUS. In `GETADVDESC`, the first two
-manufacturer bytes are company ID `0xFFFF`, followed by four IPv4 bytes and a
+manufacturer bytes are company ID `0xFFFF`, followed by four IPv4 bytes, a
 two-byte little-endian unsigned PID reading in millivolts (saturated at
-3500 mV). The web dashboard shows the firmware version and hardware revision
-`HW 0.1.1`.
+3500 mV), and a two-byte little-endian signed BMP180 temperature in hundredths
+of a degree Celsius (`0x7FFF` means no data). The scan response carries the
+10-byte manufacturer structure plus the device name and fits the 31-byte BLE
+limit exactly at the maximum 17-byte name. The web dashboard shows the firmware
+version and hardware revision `HW 0.1.1`.
 
 The PID sensor uses GPIO32 (ADC1), which remains available while Wi-Fi is
 active. Its measured voltage is averaged over 60 samples by default, then

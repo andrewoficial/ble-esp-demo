@@ -32,9 +32,23 @@ static const ble_uuid128_t nus_rx_uuid =
 static const ble_uuid128_t nus_tx_uuid =
     BLE_UUID128_INIT(0x9e,0xca,0xdc,0x24,0x0e,0xe5,0xa9,0xe0,0x93,0xf3,0xa3,0xb5,0x03,0x00,0x40,0x6e);
 
+// Manufacturer data (scan response), payload после company id, little-endian:
+//   [0..1]  company id 0xFFFF (Android отдаёт payload без него)
+//   [2..5]  IPv4-адрес, байты по порядку октетов (192.168.x.x)
+//   [6..7]  uint16 PID, целые мВ (насыщение 0..3500)
+//   [8..9]  int16 температура BMP180 в сотых долях °C (0x7FFF — нет данных)
+#define ADV_MFG_LEN 10
+
+// Scan response вмещает BLE_HS_ADV_MAX_SZ (31) байт: AD-структура mfg занимает
+// 2 + ADV_MFG_LEN = 12, AD-структура имени (1 + 1 + APP_BLE_NAME_MAX_LEN) = 19.
+// Итого ровно 31 при максимальном имени — проверяем раскладку при компиляции,
+// чтобы будущее расширение рекламы не сломало пакет молча.
+_Static_assert(2 + ADV_MFG_LEN + 2 + APP_BLE_NAME_MAX_LEN <= BLE_HS_ADV_MAX_SZ,
+               "advertising scan response does not fit 31 bytes");
+
 static uint16_t tx_val_handle;
 
-static void build_manufacturer_data(uint8_t mfg[8])
+static void build_manufacturer_data(uint8_t mfg[10])
 {
     char ip[16];
     app_get_ip_string(ip, sizeof(ip));
@@ -46,11 +60,27 @@ static void build_manufacturer_data(uint8_t mfg[8])
         pid_mv = 3500;
     }
 
+    float bmx_temp_c = 0.0f;
+    int32_t bmx_pressure_pa = 0;
+    bool bmx_ready = app_get_bmx_reading(&bmx_temp_c, &bmx_pressure_pa);
+    // Температура BMP180: int16 LE в сотых долях °C, 0x7FFF — нет данных.
+    int32_t temp_h = 0x7FFF;
+    if (bmx_ready) {
+        temp_h = (int32_t)(bmx_temp_c * 100.0f + (bmx_temp_c >= 0.0f ? 0.5f : -0.5f));
+        if (temp_h > 32766) {
+            temp_h = 32766;
+        } else if (temp_h < -32768) {
+            temp_h = -32768;
+        }
+    }
+
     mfg[0] = 0xFF;
     mfg[1] = 0xFF;
     sscanf(ip, "%hhu.%hhu.%hhu.%hhu", &mfg[2], &mfg[3], &mfg[4], &mfg[5]);
     mfg[6] = (uint8_t)(pid_mv & 0xFF);
     mfg[7] = (uint8_t)((uint32_t)pid_mv >> 8);
+    mfg[8] = (uint8_t)(temp_h & 0xFF);
+    mfg[9] = (uint8_t)((uint32_t)temp_h >> 8);
 }
 
 void ble_nus_get_advertising_description(char *buf, size_t len)
@@ -59,7 +89,7 @@ void ble_nus_get_advertising_description(char *buf, size_t len)
         return;
     }
 
-    uint8_t mfg[8];
+    uint8_t mfg[ADV_MFG_LEN];
     build_manufacturer_data(mfg);
 
     int written = snprintf(buf, len,
@@ -83,7 +113,28 @@ void ble_nus_get_advertising_description(char *buf, size_t len)
     }
     if (pos < len) {
         int32_t pid_mv = (int32_t)mfg[6] | ((int32_t)mfg[7] << 8);
-        snprintf(buf + pos, len - pos, " pid_mv=%ld", (long)pid_mv);
+        int written2 = snprintf(buf + pos, len - pos, " pid_mv=%ld", (long)pid_mv);
+        if (written2 < 0 || (size_t)written2 >= len - pos) {
+            buf[len - 1] = '\0';
+            return;
+        }
+        pos += (size_t)written2;
+    }
+    if (pos < len) {
+        int32_t temp_h = (int32_t)mfg[8] | ((int32_t)mfg[9] << 8);
+        if (temp_h >= 0x8000) {
+            temp_h -= 0x10000;
+        }
+        if (temp_h == 0x7FFF) {
+            snprintf(buf + pos, len - pos, " temp_c=n/a");
+        } else {
+            int32_t frac = temp_h % 100;
+            if (frac < 0) {
+                frac = -frac;
+            }
+            snprintf(buf + pos, len - pos, " temp_c=%ld.%02ld",
+                     (long)(temp_h / 100), (long)frac);
+        }
     }
 }
 
@@ -162,8 +213,9 @@ static esp_err_t update_advertising(void)
 {
     if (conn_handle != BLE_HS_CONN_HANDLE_NONE) return ESP_OK;
 
-    // Manufacturer data: company ID 0xFFFF + IPv4 + unsigned 16-bit PID millivolts.
-    uint8_t mfg[8];
+    // Manufacturer data (scan response): company ID 0xFFFF (2) + IPv4 (4) +
+    // uint16 PID мВ (2) + int16 температура в сотых °C (2) = 10 байт payload.
+    uint8_t mfg[ADV_MFG_LEN];
     build_manufacturer_data(mfg);
 
     struct ble_hs_adv_fields fields = {0};
@@ -182,8 +234,21 @@ static esp_err_t update_advertising(void)
     struct ble_hs_adv_fields rsp_fields = {0};
     rsp_fields.mfg_data = mfg;
     rsp_fields.mfg_data_len = sizeof(mfg);
+    // Вместимость scan response: 31 байт − AD-структура mfg (2 + payload).
+    // Страховка от переполнения: если имя не влезает, укорачиваем его —
+    // иначе ble_gap_adv_rsp_set_fields вернёт ошибку и реклама не включится.
+    size_t name_len = strlen(g_config.device_name);
+    int name_budget = BLE_HS_ADV_MAX_SZ - (int)(2 + sizeof(mfg)) - 2;
+    if (name_budget < 0) {
+        name_budget = 0;
+    }
+    if ((int)name_len > name_budget) {
+        ESP_LOGW(TAG, "Scan response is full: truncating BLE name to %d bytes",
+                 name_budget);
+        name_len = (size_t)name_budget;
+    }
     rsp_fields.name = (const uint8_t *)g_config.device_name;
-    rsp_fields.name_len = strlen(g_config.device_name);
+    rsp_fields.name_len = name_len;
     rsp_fields.name_is_complete = 1;
 
     rc = ble_gap_adv_rsp_set_fields(&rsp_fields);
